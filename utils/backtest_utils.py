@@ -244,17 +244,35 @@ def perform_simplified_backtest(df, ticker_symbol):
             }
         
         # Calculate performance metrics
-        final_equity = results['Portfolio_Value'].iloc[-1]
-        total_return = (final_equity / initial_capital - 1) * 100
+        # PROBLEM FIX: Ensure portfolio values are numeric and handle edge cases
+        initial_portfolio_value = float(initial_capital)
+        final_portfolio_value = float(results['Portfolio_Value'].iloc[-1])
         
+        # Debug logging for troubleshooting
+        logger.info(f"Initial portfolio value: {initial_portfolio_value}")
+        logger.info(f"Final portfolio value: {final_portfolio_value}")
+        
+        # Calculate total return with robust approach
+        if initial_portfolio_value > 0:
+            total_return = ((final_portfolio_value / initial_portfolio_value) - 1.0) * 100
+        else:
+            total_return = 0
+            logger.error("Initial portfolio value is zero or negative")
+            
+        logger.info(f"Calculated total return: {total_return}%")
+            
         # Make Buy & Hold calculation more robust
         try:
             # Use first and last available price without NaN
             valid_close = get_safe_series(df, 'Close').dropna()
             if len(valid_close) >= 2:
-                first_valid_close = valid_close.iloc[min(start_idx, len(valid_close)-1)]
-                last_valid_close = valid_close.iloc[-1]
-                buy_hold_return = (last_valid_close / first_valid_close - 1) * 100
+                first_valid_close = float(valid_close.iloc[min(start_idx, len(valid_close)-1)])
+                last_valid_close = float(valid_close.iloc[-1])
+                if first_valid_close > 0:  # Prevent division by zero
+                    buy_hold_return = (last_valid_close / first_valid_close - 1) * 100
+                else:
+                    buy_hold_return = 0
+                    logger.warning("First valid close price is zero or negative")
             else:
                 buy_hold_return = 0
                 logger.warning("Insufficient valid data for Buy & Hold calculation")
@@ -282,8 +300,8 @@ def perform_simplified_backtest(df, ticker_symbol):
         backtest_results = {
             "success": True,
             "ticker": ticker_symbol,
-            "initial_capital": initial_capital,
-            "final_equity": final_equity,
+            "initial_capital": initial_portfolio_value,
+            "final_equity": final_portfolio_value,
             "total_return_pct": total_return,
             "buy_hold_return_pct": buy_hold_return,
             "max_drawdown_pct": max_drawdown,
@@ -428,7 +446,7 @@ def _generate_signal_from_phase(phase, current_day):
         return "NEUTRAL - Error in signal generation"
 
 def create_backtest_charts(backtest_results, price_data=None):
-    """Create simplified charts for backtesting results"""
+    """Create simplified charts for backtesting results with position highlighting"""
     if not backtest_results["success"]:
         # Create empty chart with error message
         fig = go.Figure()
@@ -451,6 +469,38 @@ def create_backtest_charts(backtest_results, price_data=None):
         # 1. Equity curve with Buy & Hold comparison
         equity_fig = go.Figure()
         
+        # IMPROVEMENT: Add position background shading
+        # First, find continuous periods where position=1 (invested)
+        if 'Position' in trade_signals.columns:
+            position_changes = trade_signals['Position'].diff().fillna(0) != 0
+            change_points = trade_signals.index[position_changes]
+            
+            if len(change_points) > 0:
+                # Add the first and last data points to ensure complete coverage
+                change_points = pd.Index([trade_signals.index[0]]).append(change_points)
+                if change_points[-1] != trade_signals.index[-1]:
+                    change_points = change_points.append(pd.Index([trade_signals.index[-1]]))
+                
+                # Create background shapes for invested periods
+                for i in range(len(change_points) - 1):
+                    start_idx = change_points[i]
+                    end_idx = change_points[i+1]
+                    
+                    # Only color if we're invested
+                    if trade_signals.loc[start_idx, 'Position'] == 1:
+                        equity_fig.add_shape(
+                            type="rect",
+                            x0=start_idx,
+                            x1=end_idx,
+                            y0=0,  # Bottom of chart
+                            y1=1,  # Top of chart
+                            fillcolor="rgba(0,128,0,0.1)",  # Light green
+                            opacity=0.5,
+                            layer="below",
+                            yref="paper",
+                            line_width=0
+                        )
+        
         # Add equity curve
         equity_fig.add_trace(
             go.Scatter(
@@ -470,18 +520,21 @@ def create_backtest_charts(backtest_results, price_data=None):
         if price_data is not None and len(price_data) >= len(equity_curve):
             price_subset = price_data.loc[first_date:last_date]
             if len(price_subset) > 0:
-                scale_factor = initial_capital / price_subset.iloc[0]
-                buy_hold_values = price_subset * scale_factor
-                
-                equity_fig.add_trace(
-                    go.Scatter(
-                        x=buy_hold_values.index,
-                        y=buy_hold_values,
-                        mode='lines',
-                        name='Buy & Hold',
-                        line=dict(color='gray', width=1.5, dash='dash')
+                # FIXED: Ensure proper scaling for Buy & Hold
+                first_price = float(price_subset.iloc[0])
+                if first_price > 0:  # Prevent division by zero
+                    scale_factor = initial_capital / first_price
+                    buy_hold_values = price_subset * scale_factor
+                    
+                    equity_fig.add_trace(
+                        go.Scatter(
+                            x=buy_hold_values.index,
+                            y=buy_hold_values,
+                            mode='lines',
+                            name='Buy & Hold',
+                            line=dict(color='gray', width=1.5, dash='dash')
+                        )
                     )
-                )
         
         # Add buy and sell markers
         buy_dates = []
@@ -503,7 +556,7 @@ def create_backtest_charts(backtest_results, price_data=None):
                 y=buy_values,
                 mode='markers',
                 name='Buy',
-                marker=dict(symbol='triangle-up', size=10, color='green')
+                marker=dict(symbol='triangle-up', size=12, color='green')
             )
         )
         
@@ -513,7 +566,7 @@ def create_backtest_charts(backtest_results, price_data=None):
                 y=sell_values,
                 mode='markers',
                 name='Sell',
-                marker=dict(symbol='triangle-down', size=10, color='red')
+                marker=dict(symbol='triangle-down', size=12, color='red')
             )
         )
         
