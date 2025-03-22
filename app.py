@@ -4,9 +4,31 @@ import logging
 import warnings
 import os
 
-# Import the WeinsteinTickerAnalyzer class
+# Korrekte Import-Anweisung mit Fehlerbehandlung
+try:
+    from logging_config import setup_logging
+except ModuleNotFoundError:
+    # Fallback wenn das Modul nicht gefunden wird
+    import logging
+    import datetime
+
+    def setup_logging():
+        log_filename = f"weinstein_analyzer_{datetime.datetime.now().strftime('%Y%m%d')}.log"
+        
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(log_filename),
+                logging.StreamHandler()
+            ]
+        )
+        
+        logger = logging.getLogger('WeinsteinAnalyzer')
+        return logger
+
+# Import der WeinsteinTickerAnalyzer Klasse
 from weinstein_analyzer import WeinsteinTickerAnalyzer
-from logging_config import setup_logging
 
 # Set up logging
 logger = setup_logging()
@@ -276,7 +298,7 @@ def main():
                 else:
                     st.info("No detailed analysis available.")
             
-            # Display backtest results in sixth tab - now automatically calculated
+            # Display backtest results in sixth tab - with updated st.metric() calls
             with tabs[5]:
                 st.subheader("Weinstein Strategy Backtest")
                 
@@ -303,16 +325,15 @@ def main():
                     # Show strategy comparison
                     strategy_return = backtest_results["total_return_pct"]
                     buy_hold_return = backtest_results["buy_hold_return_pct"]
-                    strategy_color = "green" if strategy_return > buy_hold_return else "red"
                     
                     col1, col2, col3 = st.columns(3)
                     
                     with col1:
+                        # KORRIGIERT: delta_color Parameter entfernt
                         st.metric(
                             "Strategy Return",
                             f"{strategy_return:.2f}%",
-                            f"{strategy_return - buy_hold_return:.2f}% vs. Buy & Hold",
-                            delta_color=strategy_color
+                            f"{strategy_return - buy_hold_return:.2f}% vs. Buy & Hold"
                         )
                     
                     with col2:
