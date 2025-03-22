@@ -298,7 +298,7 @@ def main():
                 else:
                     st.info("No detailed analysis available.")
             
-            # Display backtest results in sixth tab - with updated st.metric() calls
+            # Display backtest results in sixth tab
             with tabs[5]:
                 st.subheader("Weinstein Strategy Backtest")
                 
@@ -316,20 +316,17 @@ def main():
                 if analyzer.backtest_results and analyzer.backtest_results["success"]:
                     backtest_results = analyzer.backtest_results
                     
-                    # Create backtest charts
-                    equity_chart, metrics_chart = analyzer.create_simplified_backtest_charts(backtest_results)
-                    
-                    # Show performance metrics
-                    st.plotly_chart(metrics_chart, use_container_width=True)
+                    # Create backtest chart - note that it now returns only one chart
+                    equity_chart = analyzer.create_simplified_backtest_charts(backtest_results)
                     
                     # Show strategy comparison
                     strategy_return = backtest_results["total_return_pct"]
                     buy_hold_return = backtest_results["buy_hold_return_pct"]
+                    net_profit = backtest_results.get("net_profit_usd", 0.0)
                     
                     col1, col2, col3 = st.columns(3)
                     
                     with col1:
-                        # KORRIGIERT: delta_color Parameter entfernt
                         st.metric(
                             "Strategy Return",
                             f"{strategy_return:.2f}%",
@@ -352,8 +349,21 @@ def main():
                     st.subheader("Equity Curve and Trades")
                     st.plotly_chart(equity_chart, use_container_width=True)
                     
-                    # Show trade history in collapsible section
+                    # Show trade history in collapsible section with total profit/loss summary
                     with st.expander("Trade History"):
+                        # Display total profit/loss summary
+                        total_profit = backtest_results.get("total_profit_usd", 0)
+                        total_loss = backtest_results.get("total_loss_usd", 0)
+                        net_profit = backtest_results.get("net_profit_usd", 0)
+                        
+                        profit_col, loss_col, net_col = st.columns(3)
+                        with profit_col:
+                            st.metric("Total Profit", f"${total_profit:.2f}", delta=None)
+                        with loss_col:
+                            st.metric("Total Loss", f"${total_loss:.2f}", delta=None)
+                        with net_col:
+                            st.metric("Net P/L", f"${net_profit:.2f}", delta=None)
+                        
                         # Convert trade history to DataFrame for display
                         if backtest_results["trades"]:
                             trade_df = pd.DataFrame(backtest_results["trades"])
@@ -395,7 +405,8 @@ def main():
                     - **Excess Return**: Shows how much better or worse the strategy performed compared to a simple Buy & Hold strategy
                     - **Green triangles**: Buy signals according to the Weinstein strategy
                     - **Red triangles**: Sell signals (either due to phase change or stop-loss)
-                    - **Flat areas**: Periods without investment (cash position)
+                    - **Green background**: Periods when you were invested (holding a position)
+                    - **White background**: Periods without investment (cash position)
                     """)
                     
                 else:
