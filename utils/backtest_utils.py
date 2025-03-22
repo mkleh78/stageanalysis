@@ -11,6 +11,8 @@ def perform_simplified_backtest(df, ticker_symbol):
     """
     Simplified backtesting function for the Weinstein strategy.
     Uses fixed parameters: 100.000 USD initial capital and 90% position size.
+    
+    Returns a dictionary with the backtest results.
     """
     if df is None or len(df) < 30:
         return {
@@ -42,12 +44,21 @@ def perform_simplified_backtest(df, ticker_symbol):
                 rs = rs.fillna(0)
                 df['RSI'] = 100 - (100 / (1 + rs))
         
-        # Fixed parameters
+        # Fixed parameters - very important, these are USD values
         initial_capital = 100000.0
-        position_size_pct = 0.9
-        stop_loss_pct = 0.07
+        position_size_pct = 0.9  # 90% of capital used for position sizing
+        stop_loss_pct = 0.07     # 7% stop loss
         
         logger.info(f"Starting simplified backtest for {ticker_symbol}")
+        logger.info(f"Initial capital: ${initial_capital:.2f}")
+        
+        # Make sure we have clean price data
+        clean_close = get_safe_series(df, 'Close').dropna()
+        if len(clean_close) < 20:
+            return {
+                "success": False,
+                "error": f"Not enough clean price data for backtest. Found only {len(clean_close)} valid price points."
+            }
         
         # Prepare results DataFrame
         results = pd.DataFrame(index=df.index)
@@ -55,20 +66,21 @@ def perform_simplified_backtest(df, ticker_symbol):
         results['Signal'] = 'NONE'
         results['Phase'] = 0
         results['Position'] = 0  # 0: no position, 1: long
-        results['Cash'] = initial_capital
-        results['Shares'] = 0
-        results['Portfolio_Value'] = initial_capital
+        results['Cash'] = float(initial_capital)  # Explicitly set as float
+        results['Shares'] = 0.0
+        results['Portfolio_Value'] = float(initial_capital)
         results['Trade_Start'] = False
         results['Trade_End'] = False
         results['Stop_Loss'] = 0.0
         
         # Variables for trading logic
         in_position = False
-        entry_price = 0
+        entry_price = 0.0
         entry_date = None
-        shares_held = 0
-        stop_level = 0
+        shares_held = 0.0
+        stop_level = 0.0
         trades = []
+        current_cash = float(initial_capital)
         
         # Main loop: Process each data point starting from the 30th day or earliest possible
         start_idx = min(30, len(df) - 10)  # Ensure we have at least 10 trading periods
@@ -81,60 +93,71 @@ def perform_simplified_backtest(df, ticker_symbol):
             
             # Safely extract Close value
             try:
+                # Ensure we have a floating point value
                 current_price = float(current_day['Close'])
                 if pd.isna(current_price):
+                    logger.warning(f"NaN price at {current_date} - skipping")
                     continue  # Skip data with NaN values
             except Exception as e:
-                logger.warning(f"Error accessing Close price: {str(e)}")
+                logger.warning(f"Error accessing Close price at {current_date}: {str(e)}")
                 continue
             
-            # Day's low for stop-loss check (with fallback)
+            # Get current Low price for stop-loss check (with fallback)
             try:
                 day_low = float(get_safe_series(df, 'Low').iloc[i])
                 if pd.isna(day_low):
                     day_low = current_price * 0.99  # Fallback: 1% below Close
             except Exception as e:
-                logger.warning(f"Error accessing Low price: {str(e)}")
+                logger.warning(f"Error accessing Low price at {current_date}: {str(e)}")
                 day_low = current_price * 0.99  # Fallback
             
             # Identify phase and signal
             phase = _determine_historical_phase(hist_window, current_day)
             signal = _generate_signal_from_phase(phase, current_day)
             
-            # Store results
+            # Store phase and signal in results
             results.loc[current_date, 'Phase'] = phase
             results.loc[current_date, 'Signal'] = signal
             
             # Trading logic (entry and exit)
-            if not in_position:
-                # Check for buy signals - with extended conditions
+            if not in_position:  # Looking for entry
+                # Check for buy signals
                 if ('BUY' in signal or 'KAUFEN' in signal or 
                     'ACCUMULATE' in signal or 
                     (phase == 2 and 'WATCH' not in signal and 'NEUTRAL' not in signal)):  # Buy in Phase 2
                     
-                    # Calculate position size
-                    cash = results.loc[current_date, 'Cash']
-                    position_value = cash * position_size_pct
-                    shares_to_buy = position_value / current_price
+                    # Calculate position size based on current cash
+                    position_value = current_cash * position_size_pct
                     
-                    # Open position
-                    in_position = True
-                    entry_price = current_price
-                    entry_date = current_date
-                    shares_held = shares_to_buy
-                    
-                    # Set stop-loss (7% below entry price)
-                    stop_level = entry_price * (1 - stop_loss_pct)
-                    
-                    # Update portfolio
-                    results.loc[current_date, 'Cash'] = cash - (shares_to_buy * current_price)
-                    results.loc[current_date, 'Shares'] = shares_to_buy
-                    results.loc[current_date, 'Trade_Start'] = True
-                    results.loc[current_date, 'Stop_Loss'] = stop_level
-                    
-                    logger.info(f"BACKTEST: {current_date} - BUY {shares_to_buy:.2f} shares at ${current_price:.2f}")
+                    # Calculate number of shares to buy
+                    if current_price > 0:  # Avoid division by zero
+                        shares_to_buy = position_value / current_price
+                        # Ensure shares_to_buy is a proper float
+                        shares_to_buy = float(shares_to_buy)
+                        
+                        # Open position
+                        in_position = True
+                        entry_price = current_price
+                        entry_date = current_date
+                        shares_held = shares_to_buy
+                        
+                        # Update cash balance (deduct cost of shares)
+                        current_cash -= (shares_held * current_price)
+                        
+                        # Set stop-loss (7% below entry price)
+                        stop_level = entry_price * (1 - stop_loss_pct)
+                        
+                        # Update portfolio tracking dataframe
+                        results.loc[current_date, 'Cash'] = current_cash
+                        results.loc[current_date, 'Shares'] = shares_held
+                        results.loc[current_date, 'Trade_Start'] = True
+                        results.loc[current_date, 'Stop_Loss'] = stop_level
+                        results.loc[current_date, 'Position'] = 1  # Now in position
+                        
+                        logger.info(f"BACKTEST: {current_date} - BUY {shares_held:.2f} shares at ${current_price:.2f}")
+                        logger.info(f"Cash after purchase: ${current_cash:.2f}")
             
-            else:  # In position
+            else:  # Already in position - check for exit
                 # Check for exit signals
                 exit_signal = False
                 exit_reason = ""
@@ -144,9 +167,10 @@ def perform_simplified_backtest(df, ticker_symbol):
                 if day_low <= stop_level:
                     exit_signal = True
                     exit_reason = "Stop-Loss"
-                    exit_price = stop_level  # Assume sell at stop-loss price
+                    exit_price = stop_level  # Assume sold at stop-loss price
+                    logger.info(f"Stop-loss triggered at {current_date}: {stop_level:.2f}")
                 
-                # Sell signal?
+                # Sell signal from market phase?
                 elif ('SELL' in signal or 'VERKAUFEN' in signal or 
                       'REDUCE' in signal or 'AVOID' in signal or
                       phase == 4):  # Always sell in Phase 4 (Downtrend)
@@ -156,36 +180,43 @@ def perform_simplified_backtest(df, ticker_symbol):
                 # Close position if exit signal
                 if exit_signal:
                     # Calculate profit/loss
+                    profit_per_share = exit_price - entry_price
                     trade_profit_pct = (exit_price / entry_price - 1) * 100
-                    trade_profit = shares_held * (exit_price - entry_price)
+                    trade_profit_usd = shares_held * profit_per_share
                     
-                    # Update portfolio
-                    results.loc[current_date, 'Cash'] += shares_held * exit_price
-                    results.loc[current_date, 'Shares'] = 0
+                    # Update cash balance (add proceeds from sale)
+                    current_cash += shares_held * exit_price
+                    
+                    # Update portfolio tracking dataframe
+                    results.loc[current_date, 'Cash'] = current_cash
+                    results.loc[current_date, 'Shares'] = 0.0
+                    results.loc[current_date, 'Position'] = 0  # No longer in position
                     results.loc[current_date, 'Trade_End'] = True
                     
                     # Log trade
                     trade = {
                         'Entry_Date': entry_date,
-                        'Entry_Price': entry_price,
+                        'Entry_Price': float(entry_price),
                         'Exit_Date': current_date,
-                        'Exit_Price': exit_price,
+                        'Exit_Price': float(exit_price),
                         'Reason': exit_reason,
-                        'Shares': shares_held,
-                        'Profit_Percent': trade_profit_pct,
-                        'Profit_USD': trade_profit,
+                        'Shares': float(shares_held),
+                        'Profit_Percent': float(trade_profit_pct),
+                        'Profit_USD': float(trade_profit_usd),
                         'Holding_Period': (current_date - entry_date).days
                     }
                     trades.append(trade)
                     
-                    logger.info(f"BACKTEST: {current_date} - SELL {shares_held:.2f} shares at ${exit_price:.2f}, Profit: {trade_profit_pct:.2f}%")
+                    logger.info(f"BACKTEST: {current_date} - SELL {shares_held:.2f} shares at ${exit_price:.2f}")
+                    logger.info(f"Trade profit: ${trade_profit_usd:.2f} ({trade_profit_pct:.2f}%)")
+                    logger.info(f"Cash after sale: ${current_cash:.2f}")
                     
-                    # Reset
+                    # Reset position variables
                     in_position = False
-                    entry_price = 0
+                    entry_price = 0.0
                     entry_date = None
-                    shares_held = 0
-                    stop_level = 0
+                    shares_held = 0.0
+                    stop_level = 0.0
                 
                 # Update trailing stop if price increases
                 elif current_price > entry_price * 1.1:  # At least 10% profit
@@ -196,11 +227,11 @@ def perform_simplified_backtest(df, ticker_symbol):
                     if new_stop > stop_level:
                         stop_level = new_stop
                         results.loc[current_date, 'Stop_Loss'] = stop_level
-        
+                        logger.info(f"Updated stop-loss at {current_date}: {stop_level:.2f}")
+            
             # Calculate portfolio value (Cash + Position value)
             position_value = results.loc[current_date, 'Shares'] * current_price
             results.loc[current_date, 'Portfolio_Value'] = results.loc[current_date, 'Cash'] + position_value
-            results.loc[current_date, 'Position'] = 1 if in_position else 0
         
         # Close last trade if still open (for meaningful comparison)
         if in_position:
@@ -208,32 +239,37 @@ def perform_simplified_backtest(df, ticker_symbol):
             last_price = float(df['Close'].iloc[-1])
             
             # Calculate profit/loss
+            profit_per_share = last_price - entry_price
             trade_profit_pct = (last_price / entry_price - 1) * 100
-            trade_profit = shares_held * (last_price - entry_price)
+            trade_profit_usd = shares_held * profit_per_share
+            
+            # Update cash balance
+            current_cash += shares_held * last_price
             
             # Update portfolio
-            results.loc[last_date, 'Cash'] += shares_held * last_price
-            results.loc[last_date, 'Shares'] = 0
+            results.loc[last_date, 'Cash'] = current_cash
+            results.loc[last_date, 'Shares'] = 0.0
+            results.loc[last_date, 'Position'] = 0
             results.loc[last_date, 'Trade_End'] = True
+            results.loc[last_date, 'Portfolio_Value'] = current_cash  # Final portfolio value is all cash
             
             # Log trade
             trade = {
                 'Entry_Date': entry_date,
-                'Entry_Price': entry_price,
+                'Entry_Price': float(entry_price),
                 'Exit_Date': last_date,
-                'Exit_Price': last_price,
+                'Exit_Price': float(last_price),
                 'Reason': "End of test period",
-                'Shares': shares_held,
-                'Profit_Percent': trade_profit_pct,
-                'Profit_USD': trade_profit,
+                'Shares': float(shares_held),
+                'Profit_Percent': float(trade_profit_pct),
+                'Profit_USD': float(trade_profit_usd),
                 'Holding_Period': (last_date - entry_date).days
             }
             trades.append(trade)
             
-            logger.info(f"BACKTEST: {last_date} - FINAL TRADE CLOSED {shares_held:.2f} shares at ${last_price:.2f}, Profit: {trade_profit_pct:.2f}%")
-            
-            # Update final portfolio value
-            results.loc[last_date, 'Portfolio_Value'] = results.loc[last_date, 'Cash']
+            logger.info(f"BACKTEST: {last_date} - FINAL TRADE CLOSED {shares_held:.2f} shares at ${last_price:.2f}")
+            logger.info(f"Final trade profit: ${trade_profit_usd:.2f} ({trade_profit_pct:.2f}%)")
+            logger.info(f"Final cash balance: ${current_cash:.2f}")
         
         # Check if trades occurred
         if len(trades) == 0:
@@ -243,48 +279,65 @@ def perform_simplified_backtest(df, ticker_symbol):
                 "error": "No trades were generated in the backtest period. Try a longer period or different stock."
             }
         
-        # Calculate performance metrics
-        # PROBLEM FIX: Ensure portfolio values are numeric and handle edge cases
+        # Calculate strategy return - TRIPLE CHECK APPROACH
+        # Method 1: Using final portfolio value vs initial capital
         initial_portfolio_value = float(initial_capital)
         final_portfolio_value = float(results['Portfolio_Value'].iloc[-1])
         
-        # Debug logging for troubleshooting
-        logger.info(f"Initial portfolio value: {initial_portfolio_value}")
-        logger.info(f"Final portfolio value: {final_portfolio_value}")
+        strategy_return_method1 = ((final_portfolio_value / initial_portfolio_value) - 1.0) * 100.0
+        logger.info(f"Strategy return (Method 1): {strategy_return_method1:.2f}%")
         
-        # Calculate total return with robust approach
-        if initial_portfolio_value > 0:
-            total_return = ((final_portfolio_value / initial_portfolio_value) - 1.0) * 100
-        else:
-            total_return = 0
-            logger.error("Initial portfolio value is zero or negative")
+        # Method 2: Sum all trade profits
+        total_trade_profit_usd = sum(trade['Profit_USD'] for trade in trades)
+        strategy_return_method2 = (total_trade_profit_usd / initial_portfolio_value) * 100.0
+        logger.info(f"Strategy return (Method 2): {strategy_return_method2:.2f}%")
+        
+        # Method 3: Check portfolio value directly
+        first_portfolio_value = float(results['Portfolio_Value'].iloc[0])
+        last_portfolio_value = float(results['Portfolio_Value'].iloc[-1])
+        strategy_return_method3 = ((last_portfolio_value / first_portfolio_value) - 1.0) * 100.0
+        logger.info(f"Strategy return (Method 3): {strategy_return_method3:.2f}%")
+        
+        # Use Method 1 as our official return, but log discrepancies for debugging
+        strategy_return = strategy_return_method1
+        
+        if abs(strategy_return_method1 - strategy_return_method2) > 0.1:
+            logger.warning(f"Strategy return calculation discrepancy between methods 1 and 2: {abs(strategy_return_method1 - strategy_return_method2):.2f}%")
+        
+        if abs(strategy_return_method1 - strategy_return_method3) > 0.1:
+            logger.warning(f"Strategy return calculation discrepancy between methods 1 and 3: {abs(strategy_return_method1 - strategy_return_method3):.2f}%")
             
-        logger.info(f"Calculated total return: {total_return}%")
-            
-        # Make Buy & Hold calculation more robust
+        # Buy & Hold calculation - completely rewritten for reliability
+        buy_hold_return = 0.0
         try:
-            # Use first and last available price without NaN
+            # Get clean price data for start and end
             valid_close = get_safe_series(df, 'Close').dropna()
             if len(valid_close) >= 2:
-                first_valid_close = float(valid_close.iloc[min(start_idx, len(valid_close)-1)])
-                last_valid_close = float(valid_close.iloc[-1])
-                if first_valid_close > 0:  # Prevent division by zero
-                    buy_hold_return = (last_valid_close / first_valid_close - 1) * 100
-                else:
-                    buy_hold_return = 0
-                    logger.warning("First valid close price is zero or negative")
-            else:
-                buy_hold_return = 0
-                logger.warning("Insufficient valid data for Buy & Hold calculation")
+                first_price = float(valid_close.iloc[min(start_idx, len(valid_close)-1)])
+                last_price = float(valid_close.iloc[-1])
+                
+                # Explicitly calculate buy and hold return
+                if first_price > 0:
+                    buy_hold_shares = initial_capital / first_price
+                    buy_hold_end_value = buy_hold_shares * last_price
+                    buy_hold_return = ((buy_hold_end_value / initial_capital) - 1.0) * 100.0
+                    
+                    logger.info(f"Buy & Hold: Bought {buy_hold_shares:.2f} shares at ${first_price:.2f}")
+                    logger.info(f"Buy & Hold: End value ${buy_hold_end_value:.2f}")
+                    logger.info(f"Buy & Hold return: {buy_hold_return:.2f}%")
         except Exception as e:
             logger.error(f"Error in Buy & Hold calculation: {str(e)}")
-            buy_hold_return = 0
+            buy_hold_return = 0.0
         
         # Calculate drawdown
-        equity_series = results['Portfolio_Value']
-        rolling_max = equity_series.expanding().max()
-        drawdown = 100 * ((equity_series / rolling_max) - 1)
-        max_drawdown = drawdown.min()
+        try:
+            equity_series = results['Portfolio_Value']
+            rolling_max = equity_series.expanding().max()
+            drawdown = 100 * ((equity_series / rolling_max) - 1)
+            max_drawdown = float(drawdown.min())
+        except Exception as e:
+            logger.error(f"Error calculating drawdown: {str(e)}")
+            max_drawdown = 0.0
         
         # Trading statistics
         total_trades = len(trades)
@@ -292,35 +345,61 @@ def perform_simplified_backtest(df, ticker_symbol):
         losing_trades = total_trades - winning_trades
         win_rate = winning_trades / total_trades if total_trades > 0 else 0
         
-        # Average profit and loss
-        avg_profit = sum(trade['Profit_Percent'] for trade in trades if trade['Profit_USD'] > 0) / winning_trades if winning_trades > 0 else 0
-        avg_loss = sum(trade['Profit_Percent'] for trade in trades if trade['Profit_USD'] <= 0) / losing_trades if losing_trades > 0 else 0
+        # Calculate trade summary (total P/L)
+        total_profit_usd = sum(trade['Profit_USD'] for trade in trades if trade['Profit_USD'] > 0)
+        total_loss_usd = sum(trade['Profit_USD'] for trade in trades if trade['Profit_USD'] <= 0)
+        net_profit_usd = total_profit_usd + total_loss_usd
         
-        # Summarize results
+        # Average profit and loss
+        avg_profit = 0.0
+        avg_loss = 0.0
+        
+        if winning_trades > 0:
+            avg_profit = sum(trade['Profit_Percent'] for trade in trades if trade['Profit_USD'] > 0) / winning_trades
+        
+        if losing_trades > 0:
+            avg_loss = sum(trade['Profit_Percent'] for trade in trades if trade['Profit_USD'] <= 0) / losing_trades
+        
+        # Add trade summary to each trade for display
+        for trade in trades:
+            # Make sure all fields are proper Python types, not pandas or numpy types
+            for key in trade:
+                if isinstance(trade[key], (pd.Timestamp, np.datetime64)):
+                    # Keep timestamps as is
+                    pass
+                elif isinstance(trade[key], (np.integer, np.floating)):
+                    trade[key] = float(trade[key])
+        
+        # Complete results summary
         backtest_results = {
             "success": True,
             "ticker": ticker_symbol,
-            "initial_capital": initial_portfolio_value,
-            "final_equity": final_portfolio_value,
-            "total_return_pct": total_return,
-            "buy_hold_return_pct": buy_hold_return,
-            "max_drawdown_pct": max_drawdown,
-            "total_trades": total_trades,
-            "winning_trades": winning_trades,
-            "losing_trades": losing_trades,
-            "win_rate": win_rate,
-            "avg_profit_pct": avg_profit,
-            "avg_loss_pct": avg_loss,
+            "initial_capital": float(initial_capital),
+            "final_equity": float(final_portfolio_value),
+            "total_return_pct": float(strategy_return),
+            "buy_hold_return_pct": float(buy_hold_return),
+            "max_drawdown_pct": float(max_drawdown),
+            "total_trades": int(total_trades),
+            "winning_trades": int(winning_trades),
+            "losing_trades": int(losing_trades),
+            "win_rate": float(win_rate),
+            "avg_profit_pct": float(avg_profit),
+            "avg_loss_pct": float(avg_loss),
+            "total_profit_usd": float(total_profit_usd),
+            "total_loss_usd": float(total_loss_usd),
+            "net_profit_usd": float(net_profit_usd),
             "trades": trades,
             "equity_curve": results['Portfolio_Value'],
             "trade_signals": results[['Phase', 'Signal', 'Position', 'Trade_Start', 'Trade_End']]
         }
         
-        logger.info(f"Backtest for {ticker_symbol} completed: {total_return:.2f}% total return")
+        logger.info(f"Backtest for {ticker_symbol} completed: {strategy_return:.2f}% total return")
+        logger.info(f"Win rate: {win_rate*100:.1f}% ({winning_trades}/{total_trades} trades)")
+        logger.info(f"Net profit: ${net_profit_usd:.2f}")
         return backtest_results
         
     except Exception as e:
-        logger.error(f"Backtest error: {str(e)}")
+        logger.error(f"Critical backtest error: {str(e)}")
         traceback.print_exc()
         return {
             "success": False,
@@ -446,7 +525,7 @@ def _generate_signal_from_phase(phase, current_day):
         return "NEUTRAL - Error in signal generation"
 
 def create_backtest_charts(backtest_results, price_data=None):
-    """Create simplified charts for backtesting results with position highlighting"""
+    """Create chart for backtest results with position highlighting"""
     if not backtest_results["success"]:
         # Create empty chart with error message
         fig = go.Figure()
@@ -458,7 +537,7 @@ def create_backtest_charts(backtest_results, price_data=None):
             font=dict(size=20)
         )
         fig.update_layout(height=600)
-        return fig, fig
+        return fig
     
     try:
         # Prepare data from backtest results
@@ -466,42 +545,46 @@ def create_backtest_charts(backtest_results, price_data=None):
         trade_signals = backtest_results['trade_signals']
         trades = backtest_results['trades']
         
-        # 1. Equity curve with Buy & Hold comparison
+        # Create equity curve chart with buy/hold comparison
         equity_fig = go.Figure()
         
-        # IMPROVEMENT: Add position background shading
-        # First, find continuous periods where position=1 (invested)
+        # Add position background shading
+        # First, determine periods where we had an open position
         if 'Position' in trade_signals.columns:
-            position_changes = trade_signals['Position'].diff().fillna(0) != 0
-            change_points = trade_signals.index[position_changes]
+            position_series = trade_signals['Position']
             
-            if len(change_points) > 0:
-                # Add the first and last data points to ensure complete coverage
-                change_points = pd.Index([trade_signals.index[0]]).append(change_points)
-                if change_points[-1] != trade_signals.index[-1]:
-                    change_points = change_points.append(pd.Index([trade_signals.index[-1]]))
+            # Get indices where position changes
+            position_changes = position_series.diff().fillna(0) != 0
+            change_points = position_series.index[position_changes].tolist()
+            
+            # Ensure we have start and end points
+            if not change_points or change_points[0] != position_series.index[0]:
+                change_points.insert(0, position_series.index[0])
+            if change_points[-1] != position_series.index[-1]:
+                change_points.append(position_series.index[-1])
+            
+            # Add background colors for positions
+            for i in range(len(change_points) - 1):
+                start_date = change_points[i]
+                end_date = change_points[i+1]
                 
-                # Create background shapes for invested periods
-                for i in range(len(change_points) - 1):
-                    start_idx = change_points[i]
-                    end_idx = change_points[i+1]
-                    
-                    # Only color if we're invested
-                    if trade_signals.loc[start_idx, 'Position'] == 1:
-                        equity_fig.add_shape(
-                            type="rect",
-                            x0=start_idx,
-                            x1=end_idx,
-                            y0=0,  # Bottom of chart
-                            y1=1,  # Top of chart
-                            fillcolor="rgba(0,128,0,0.1)",  # Light green
-                            opacity=0.5,
-                            layer="below",
-                            yref="paper",
-                            line_width=0
-                        )
+                # Only color if we were in a position (Position == 1)
+                position_value = position_series.loc[start_date]
+                if position_value == 1:
+                    equity_fig.add_shape(
+                        type="rect",
+                        x0=start_date,
+                        x1=end_date,
+                        y0=0,
+                        y1=1,
+                        xref="x",
+                        yref="paper",
+                        fillcolor="rgba(0,255,0,0.1)",  # Light green
+                        line=dict(width=0),
+                        layer="below"
+                    )
         
-        # Add equity curve
+        # Add equity curve line
         equity_fig.add_trace(
             go.Scatter(
                 x=equity_curve.index,
@@ -512,65 +595,64 @@ def create_backtest_charts(backtest_results, price_data=None):
             )
         )
         
-        # Buy & Hold line for comparison
-        initial_capital = backtest_results['initial_capital']
-        first_date = equity_curve.index[0]
-        last_date = equity_curve.index[-1]
-        
-        if price_data is not None and len(price_data) >= len(equity_curve):
-            price_subset = price_data.loc[first_date:last_date]
-            if len(price_subset) > 0:
-                # FIXED: Ensure proper scaling for Buy & Hold
-                first_price = float(price_subset.iloc[0])
-                if first_price > 0:  # Prevent division by zero
-                    scale_factor = initial_capital / first_price
-                    buy_hold_values = price_subset * scale_factor
+        # Calculate and add Buy & Hold line
+        if price_data is not None and len(price_data) > 0:
+            try:
+                initial_capital = backtest_results['initial_capital']
+                
+                # Get matching date range
+                matching_dates = price_data.index.intersection(equity_curve.index)
+                
+                if len(matching_dates) > 1:
+                    start_date = matching_dates[0]
+                    start_price = float(price_data.loc[start_date])
                     
+                    # Calculate shares bought with initial capital
+                    buy_hold_shares = initial_capital / start_price
+                    
+                    # Calculate buy & hold portfolio value over time
+                    buy_hold_values = price_data.loc[matching_dates] * buy_hold_shares
+                    
+                    # Add to chart
                     equity_fig.add_trace(
                         go.Scatter(
-                            x=buy_hold_values.index,
+                            x=matching_dates,
                             y=buy_hold_values,
                             mode='lines',
                             name='Buy & Hold',
                             line=dict(color='gray', width=1.5, dash='dash')
                         )
                     )
+            except Exception as e:
+                logger.warning(f"Error adding Buy & Hold line: {str(e)}")
         
         # Add buy and sell markers
-        buy_dates = []
-        buy_values = []
-        sell_dates = []
-        sell_values = []
+        buy_points = trade_signals[trade_signals['Trade_Start'] == True]
+        sell_points = trade_signals[trade_signals['Trade_End'] == True]
         
-        for i, row in trade_signals.iterrows():
-            if row['Trade_Start']:
-                buy_dates.append(i)
-                buy_values.append(equity_curve.loc[i])
-            elif row['Trade_End']:
-                sell_dates.append(i)
-                sell_values.append(equity_curve.loc[i])
-        
-        equity_fig.add_trace(
-            go.Scatter(
-                x=buy_dates,
-                y=buy_values,
-                mode='markers',
-                name='Buy',
-                marker=dict(symbol='triangle-up', size=12, color='green')
+        if not buy_points.empty:
+            equity_fig.add_trace(
+                go.Scatter(
+                    x=buy_points.index,
+                    y=equity_curve.loc[buy_points.index],
+                    mode='markers',
+                    name='Buy',
+                    marker=dict(symbol='triangle-up', size=12, color='green')
+                )
             )
-        )
         
-        equity_fig.add_trace(
-            go.Scatter(
-                x=sell_dates,
-                y=sell_values,
-                mode='markers',
-                name='Sell',
-                marker=dict(symbol='triangle-down', size=12, color='red')
+        if not sell_points.empty:
+            equity_fig.add_trace(
+                go.Scatter(
+                    x=sell_points.index,
+                    y=equity_curve.loc[sell_points.index],
+                    mode='markers',
+                    name='Sell',
+                    marker=dict(symbol='triangle-down', size=12, color='red')
+                )
             )
-        )
         
-        # Update layout
+        # Update equity chart layout
         equity_fig.update_layout(
             title=f"Equity Curve - {backtest_results['ticker']}",
             xaxis_title="Date",
@@ -584,68 +666,28 @@ def create_backtest_charts(backtest_results, price_data=None):
                 x=1
             ),
             hovermode="x unified",
-            yaxis=dict(
-                tickprefix="$"
-            )
+            plot_bgcolor='white',
+            paper_bgcolor='white',
+            margin=dict(l=50, r=50, t=80, b=50)
         )
         
-        # 2. Performance metrics table
-        perf_fig = go.Figure()
+        # Format y-axis with dollar signs
+        equity_fig.update_yaxes(tickprefix="$")
         
-        # Basic metrics
-        metrics = {
-            'Total Return': f"{backtest_results['total_return_pct']:.2f}%",
-            'Buy & Hold Return': f"{backtest_results['buy_hold_return_pct']:.2f}%",
-            'Excess Return': f"{backtest_results['total_return_pct'] - backtest_results['buy_hold_return_pct']:.2f}%",
-            'Max Drawdown': f"{backtest_results['max_drawdown_pct']:.2f}%",
-            'Number of Trades': str(backtest_results['total_trades']),
-            'Winners': f"{backtest_results['winning_trades']} ({backtest_results['win_rate']*100:.1f}%)",
-            'Losers': str(backtest_results['losing_trades']),
-            'Avg. Win': f"{backtest_results['avg_profit_pct']:.2f}%",
-            'Avg. Loss': f"{backtest_results['avg_loss_pct']:.2f}%"
-        }
-        
-        # Create table
-        perf_fig.add_trace(
-            go.Table(
-                header=dict(
-                    values=['Metric', 'Value'],
-                    fill_color='paleturquoise',
-                    align='left',
-                    font=dict(size=14)
-                ),
-                cells=dict(
-                    values=[
-                        list(metrics.keys()),
-                        list(metrics.values())
-                    ],
-                    fill_color=[['white', 'lightgrey'] * 5],
-                    align='left',
-                    font=dict(size=12)
-                )
-            )
-        )
-        
-        perf_fig.update_layout(
-            title="Performance Metrics",
-            height=400,
-            margin=dict(l=0, r=0, t=40, b=0)
-        )
-        
-        return equity_fig, perf_fig
+        return equity_fig
         
     except Exception as e:
-        logger.error(f"Error creating backtest charts: {str(e)}")
+        logger.error(f"Error creating backtest chart: {str(e)}")
         traceback.print_exc()
         
         # Return empty chart with error message
         fig = go.Figure()
         fig.add_annotation(
-            text=f"Error creating backtest charts: {str(e)}",
+            text=f"Error creating backtest chart: {str(e)}",
             xref="paper", yref="paper",
             x=0.5, y=0.5,
             showarrow=False,
             font=dict(size=12)
         )
         fig.update_layout(height=600)
-        return fig, fig
+        return fig
