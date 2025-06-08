@@ -4,6 +4,10 @@ import datetime
 import logging
 import traceback
 import yfinance as yf
+from typing import Optional, Dict, List, Tuple, Union, Any
+from dataclasses import dataclass, field
+from functools import lru_cache
+from contextlib import contextmanager
 
 # Import utility modules
 from utils.data_utils import (
@@ -20,37 +24,264 @@ from utils.backtest_utils import perform_simplified_backtest, create_backtest_ch
 
 logger = logging.getLogger('WeinsteinAnalyzer')
 
+
+@dataclass
+class AnalysisResult:
+    """Strukturiertes Ergebnis der Weinstein-Analyse"""
+    success: bool
+    ticker: str
+    phase: int
+    phase_description: str
+    recommendation: str
+    detailed_analysis: str
+    last_price: Optional[float]
+    support_levels: List[float] = field(default_factory=list)
+    resistance_levels: List[float] = field(default_factory=list)
+    support_resistance_data: List[Dict[str, float]] = field(default_factory=list)
+    market_context: Optional[Dict[str, Any]] = None
+    sector_data: Optional[Dict[str, Any]] = None
+    backtest_results: Optional[Dict[str, Any]] = None
+    ticker_info: Dict[str, Any] = field(default_factory=dict)
+    errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+
 class WeinsteinTickerAnalyzer:
-    def __init__(self):
-        """Initializes the Weinstein Ticker Analyzer"""
-        self.data = None
-        self.ticker_symbol = None
-        self.period = "1y"
-        self.interval = "1wk"
-        self.indicators = {}
-        self.phase = 0
-        self.phase_desc = ""
-        self.recommendation = ""
-        self.detailed_analysis = ""
-        self.last_price = None
-        self.market_context = None
-        self.sector_data = None
-        self.support_resistance_levels = []
-        self.errors = []
-        self.warnings = []
-        self.ticker_info = {}
-        self.backtest_results = None
+    """
+    Analyzes stocks using the Weinstein method with enhanced error handling,
+    caching, and structured output.
+    """
+    
+    # Konstanten
+    MIN_BACKTEST_DATAPOINTS = 30
+    DEFAULT_MA_PERIOD = 30
+    MONTH_IN_WEEKS = 4
+    
+    # Valid input values
+    VALID_PERIODS = ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"]
+    VALID_INTERVALS = ["1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h", "1d", "5d", "1wk", "1mo", "3mo"]
+    
+    # Sector ETF mapping
+    SECTOR_ETF_MAP = {
+        'Information Technology': 'XLK',
+        'Financials': 'XLF',
+        'Health Care': 'XLV',
+        'Consumer Discretionary': 'XLY',
+        'Industrials': 'XLI',
+        'Communication Services': 'XLC',
+        'Consumer Staples': 'XLP',
+        'Energy': 'XLE',
+        'Materials': 'XLB',
+        'Real Estate': 'XLRE',
+        'Utilities': 'XLU',
+        'Technology': 'XLK',
+        'Financial Services': 'XLF',
+        'Healthcare': 'XLV',
+        'Consumer Cyclical': 'XLY',
+        'Communication': 'XLC',
+        'Consumer Defensive': 'XLP',
+        'Basic Materials': 'XLB',
+        'Financial': 'XLF'
+    }
+    
+    # Manual ticker to sector mapping for common stocks
+    MANUAL_TICKER_SECTOR_MAP = {
+        'AAPL': ('Information Technology', 'XLK'),
+        'MSFT': ('Information Technology', 'XLK'),
+        'AMZN': ('Consumer Discretionary', 'XLY'),
+        'GOOG': ('Communication Services', 'XLC'),
+        'GOOGL': ('Communication Services', 'XLC'),
+        'META': ('Communication Services', 'XLC'),
+        'TSLA': ('Consumer Discretionary', 'XLY'),
+        'JPM': ('Financials', 'XLF'),
+        'V': ('Financials', 'XLF'),
+        'NVDA': ('Information Technology', 'XLK'),
+        'DIS': ('Communication Services', 'XLC')
+    }
+    
+    # Industry to sector mapping
+    INDUSTRY_TO_SECTOR_MAP = {
+        'software': 'Information Technology',
+        'hardware': 'Information Technology',
+        'semiconductor': 'Information Technology',
+        'bank': 'Financials',
+        'insurance': 'Financials',
+        'pharma': 'Health Care',
+        'biotech': 'Health Care',
+        'medical': 'Health Care',
+        'retail': 'Consumer Discretionary',
+        'auto': 'Consumer Discretionary',
+        'aerospace': 'Industrials',
+        'defense': 'Industrials',
+        'telecom': 'Communication Services',
+        'media': 'Communication Services',
+        'food': 'Consumer Staples',
+        'beverage': 'Consumer Staples',
+        'oil': 'Energy',
+        'gas': 'Energy',
+        'chemical': 'Materials',
+        'mining': 'Materials',
+        'real estate': 'Real Estate',
+        'reit': 'Real Estate',
+        'utility': 'Utilities',
+        'electric': 'Utilities'
+    }
+    
+    def __init__(self, data_provider=None, logger_instance=None):
+        """
+        Initializes the Weinstein Ticker Analyzer
         
-    def load_data(self, ticker, period="1y", interval="1wk"):
-        """Load data for a specific ticker with enhanced error handling"""
-        logger.info(f"Loading data for {ticker} with period={period}, interval={interval}")
+        Args:
+            data_provider: Data provider (default: yfinance)
+            logger_instance: Logger instance (default: module logger)
+        """
+        self.data_provider = data_provider or yf
+        self.logger = logger_instance or logger
+        
+        # Data attributes
+        self.data: Optional[pd.DataFrame] = None
+        self.ticker_symbol: Optional[str] = None
+        self.period: str = "1y"
+        self.interval: str = "1wk"
+        
+        # Analysis results
+        self.indicators: Dict[str, pd.Series] = {}
+        self.phase: int = 0
+        self.phase_desc: str = ""
+        self.recommendation: str = ""
+        self.detailed_analysis: str = ""
+        self.last_price: Optional[float] = None
+        self.market_context: Optional[Dict[str, Any]] = None
+        self.sector_data: Optional[Dict[str, Any]] = None
+        self.support_resistance_levels: List[Dict[str, float]] = []
+        self.ticker_info: Dict[str, Any] = {}
+        self.backtest_results: Optional[Dict[str, Any]] = None
+        
+        # Status tracking
+        self.errors: List[str] = []
+        self.warnings: List[str] = []
+        
+        # Caching
+        self._market_data_cache: Dict[str, pd.DataFrame] = {}
+        self._sector_etf_cache: Dict[str, pd.DataFrame] = {}
+    
+    def _extract_scalar_value(self, value: Union[pd.Series, float, Any], default: float = 0) -> float:
+        """
+        Extrahiert einen Skalarwert aus Series oder einzelnem Wert
+        
+        Args:
+            value: Der zu extrahierende Wert
+            default: Standardwert bei Fehler
+            
+        Returns:
+            float: Extrahierter Skalarwert
+        """
+        try:
+            if isinstance(value, pd.Series):
+                return float(value.iloc[0]) if not value.empty and not pd.isna(value.iloc[0]) else default
+            else:
+                return float(value) if not pd.isna(value) else default
+        except Exception as e:
+            self.logger.debug(f"Error extracting scalar value: {str(e)}")
+            return default
+    
+    def _validate_inputs(self, ticker: str, period: str, interval: str) -> Tuple[str, str, str]:
+        """
+        Validiert die Eingabeparameter
+        
+        Args:
+            ticker: Ticker Symbol
+            period: Zeitperiode
+            interval: Datenintervall
+            
+        Returns:
+            Tuple[str, str, str]: Validierte Parameter
+        """
+        # Ticker validation
+        if not ticker or not isinstance(ticker, str):
+            raise ValueError("Invalid ticker symbol provided")
+        
+        ticker = ticker.strip().upper()
+        
+        # Period validation
+        if period not in self.VALID_PERIODS:
+            self.warnings.append(f"Invalid period '{period}', using default '1y'")
+            period = "1y"
+        
+        # Interval validation
+        if interval not in self.VALID_INTERVALS:
+            self.warnings.append(f"Invalid interval '{interval}', using default '1wk'")
+            interval = "1wk"
+        
+        return ticker, period, interval
+    
+    @contextmanager
+    def analysis_context(self, ticker: str):
+        """
+        Context manager für Analyse-Sessions
+        
+        Args:
+            ticker: Ticker Symbol
+        """
+        try:
+            self.logger.info(f"Starting analysis for {ticker}")
+            yield self
+        except Exception as e:
+            self.logger.error(f"Analysis failed for {ticker}: {str(e)}")
+            self.errors.append(f"Analysis failed: {str(e)}")
+            raise
+        finally:
+            self.logger.info(f"Completed analysis for {ticker}")
+    
+    def load_data(self, ticker: str, period: str = "1y", interval: str = "1wk") -> bool:
+        """
+        Hauptmethode zum Laden und Analysieren der Daten
+        
+        Args:
+            ticker: Stock ticker symbol
+            period: Time period for data (default: "1y")
+            interval: Data interval (default: "1wk")
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        with self.analysis_context(ticker):
+            # Initialisierung
+            self._initialize_analysis(ticker, period, interval)
+            
+            # Daten laden
+            if not self._fetch_ticker_data():
+                return False
+            
+            # Analyse durchführen
+            self._calculate_indicators()
+            self._load_market_and_sector_context()
+            self._analyze_phase()
+            self._generate_recommendations()
+            self._run_backtest()
+            
+            return True
+    
+    def _initialize_analysis(self, ticker: str, period: str, interval: str) -> None:
+        """
+        Initialisiert die Analyse-Parameter und setzt den Zustand zurück
+        
+        Args:
+            ticker: Ticker Symbol
+            period: Zeitperiode
+            interval: Datenintervall
+        """
+        # Validierung
+        ticker, period, interval = self._validate_inputs(ticker, period, interval)
+        
+        # Parameter setzen
         self.ticker_symbol = ticker
         self.period = period
         self.interval = interval
+        
+        # Reset state
         self.errors = []
         self.warnings = []
-        
-        # Clear previous data
         self.data = None
         self.phase = 0
         self.phase_desc = ""
@@ -61,11 +292,19 @@ class WeinsteinTickerAnalyzer:
         self.sector_data = None
         self.support_resistance_levels = []
         self.backtest_results = None
+        self.indicators = {}
+    
+    def _fetch_ticker_data(self) -> bool:
+        """
+        Lädt die Ticker-Daten
         
+        Returns:
+            bool: True wenn erfolgreich, False sonst
+        """
         try:
-            # Download data with error handling 
+            # Download data with error handling
             self.data, new_warnings, errors, actual_period, actual_interval = download_ticker_data(
-                ticker, period, interval
+                self.ticker_symbol, self.period, self.interval
             )
             
             # Update warnings and errors
@@ -73,119 +312,100 @@ class WeinsteinTickerAnalyzer:
             if errors:
                 self.errors.extend(errors)
                 return False
-                
+            
             # Update instance variables with actual values used
             self.period = actual_period
             self.interval = actual_interval
             
-            # Try to get ticker info for better context
-            self.ticker_info = get_ticker_info(normalize_ticker(ticker))
+            # Get ticker info
+            self.ticker_info = get_ticker_info(normalize_ticker(self.ticker_symbol))
             
-            # Safe extraction of last price
-            try:
-                if isinstance(self.data['Close'].iloc[-1], (pd.Series, pd.DataFrame)):
-                    self.last_price = float(self.data['Close'].iloc[-1].iloc[0])
-                else:
-                    self.last_price = float(self.data['Close'].iloc[-1])
-            except Exception as e:
-                logger.error(f"Error extracting last price: {str(e)}")
-                self.warnings.append("Could not determine the last price.")
-                self.last_price = None
-                
-            # Calculate all indicators
-            self.data = calculate_indicators(self.data)
+            # Extract last price
+            self._extract_last_price()
             
-            # Find support and resistance levels
-            self.support_resistance_levels = identify_support_resistance(self.data, self.last_price)
-            
-            # Load market context - skip for indices to avoid self-comparison
-            normalized_ticker = normalize_ticker(ticker)
-            if not is_index(normalized_ticker, self.ticker_info):
-                self.load_market_context()
-            
-            # Identify the phase
-            self.phase, self.phase_desc = identify_weinstein_phase(self.data)
-            
-            # Generate recommendation
-            self.recommendation = generate_recommendation(
-                self.data, self.phase, self.phase_desc, 
-                self.market_context, self.sector_data
-            )
-            
-            # Generate detailed analysis text
-            self.detailed_analysis = generate_detailed_analysis(
-                self.ticker_symbol, self.phase, self.phase_desc, 
-                self.recommendation, self.data, self.last_price,
-                self.market_context, self.sector_data, 
-                self.support_resistance_levels
-            )
-            
-            # Perform backtest automatically if we have enough data
-            if len(self.data) >= 30:
-                self.backtest_results = perform_simplified_backtest(self.data, self.ticker_symbol)
-                if self.backtest_results["success"]:
-                    logger.info(f"Backtest completed automatically with {self.backtest_results['total_trades']} trades")
-                else:
-                    logger.warning(f"Automatic backtest failed: {self.backtest_results.get('error', 'Unknown error')}")
-            else:
-                self.backtest_results = {
-                    "success": False,
-                    "error": f"Insufficient data for backtest. Need at least 30 data points, found {len(self.data)}."
-                }
-                logger.warning(f"Not enough data for automatic backtest: {len(self.data)} data points")
-            
-            logger.info(f"Successfully loaded and analyzed data for {ticker}")
             return True
-                
+            
         except Exception as e:
-            logger.error(f"Error loading data for {ticker}: {str(e)}")
-            traceback.print_exc()
-            self.errors.append(f"Error analyzing {ticker}: {str(e)}")
+            self.logger.error(f"Error fetching data for {self.ticker_symbol}: {str(e)}")
+            self.errors.append(f"Error fetching data: {str(e)}")
             return False
     
-    def load_market_context(self):
-        """Load market context data (S&P 500 index) for relative analysis with enhanced sector detection"""
+    def _extract_last_price(self) -> None:
+        """Extrahiert den letzten Preis aus den Daten"""
         try:
-            market_data = yf.download(
-                "^GSPC",  # S&P 500 index
-                period=self.period,
-                interval=self.interval,
+            if self.data is not None and 'Close' in self.data.columns:
+                close_series = self.data['Close']
+                if isinstance(close_series.iloc[-1], (pd.Series, pd.DataFrame)):
+                    self.last_price = float(close_series.iloc[-1].iloc[0])
+                else:
+                    self.last_price = float(close_series.iloc[-1])
+            else:
+                self.last_price = None
+                self.warnings.append("Could not determine the last price.")
+        except Exception as e:
+            self.logger.error(f"Error extracting last price: {str(e)}")
+            self.warnings.append("Could not determine the last price.")
+            self.last_price = None
+    
+    def _calculate_indicators(self) -> None:
+        """Berechnet technische Indikatoren"""
+        if self.data is not None:
+            self.data = calculate_indicators(self.data)
+            self.support_resistance_levels = identify_support_resistance(self.data, self.last_price)
+    
+    def _load_market_and_sector_context(self) -> None:
+        """Lädt Markt- und Sektor-Kontext"""
+        # Skip for indices to avoid self-comparison
+        normalized_ticker = normalize_ticker(self.ticker_symbol)
+        if not is_index(normalized_ticker, self.ticker_info):
+            self._load_market_context()
+            self._load_sector_data()
+    
+    @lru_cache(maxsize=32)
+    def _get_cached_market_data(self, symbol: str, period: str, interval: str) -> Optional[pd.DataFrame]:
+        """
+        Cached market data retrieval
+        
+        Args:
+            symbol: Market symbol
+            period: Time period
+            interval: Data interval
+            
+        Returns:
+            Optional[pd.DataFrame]: Market data or None
+        """
+        try:
+            return self.data_provider.download(
+                symbol,
+                period=period,
+                interval=interval,
                 progress=False
             )
+        except Exception as e:
+            self.logger.error(f"Error downloading {symbol}: {str(e)}")
+            return None
+    
+    def _load_market_context(self) -> None:
+        """Lädt Marktkontext-Daten (S&P 500 Index) für relative Analyse"""
+        try:
+            market_data = self._get_cached_market_data("^GSPC", self.period, self.interval)
             
-            if len(market_data) > 0:
+            if market_data is not None and len(market_data) > 0:
                 # Calculate market indicators
-                market_data['MA30'] = market_data['Close'].rolling(window=30).mean()
+                market_data['MA30'] = market_data['Close'].rolling(window=self.DEFAULT_MA_PERIOD).mean()
                 market_data['MA30_Slope'] = market_data['MA30'].diff()
                 
-                # Determine market phase - Use scalar values to avoid Series comparison issues
+                # Determine market phase
                 current = market_data.iloc[-1]
                 
-                # Ensure we have scalar values, not Series
-                try:
-                    current_close = float(current['Close']) if not pd.isna(current['Close']).any() else 0
-                    current_ma30 = float(current['MA30']) if not pd.isna(current['MA30']).any() else 0
-                    current_ma30_slope = float(current['MA30_Slope']) if not pd.isna(current['MA30_Slope']).any() else 0
-                except Exception:
-                    # Handle potential Series objects
-                    if isinstance(current['Close'], pd.Series):
-                        current_close = float(current['Close'].iloc[0]) if not current['Close'].empty and not pd.isna(current['Close'].iloc[0]) else 0
-                    else:
-                        current_close = float(current['Close']) if not pd.isna(current['Close']) else 0
-                        
-                    if isinstance(current['MA30'], pd.Series):
-                        current_ma30 = float(current['MA30'].iloc[0]) if not current['MA30'].empty and not pd.isna(current['MA30'].iloc[0]) else 0
-                    else:
-                        current_ma30 = float(current['MA30']) if not pd.isna(current['MA30']) else 0
-                        
-                    if isinstance(current['MA30_Slope'], pd.Series):
-                        current_ma30_slope = float(current['MA30_Slope'].iloc[0]) if not current['MA30_Slope'].empty and not pd.isna(current['MA30_Slope'].iloc[0]) else 0
-                    else:
-                        current_ma30_slope = float(current['MA30_Slope']) if not pd.isna(current['MA30_Slope']) else 0
+                current_close = self._extract_scalar_value(current['Close'])
+                current_ma30 = self._extract_scalar_value(current['MA30'])
+                current_ma30_slope = self._extract_scalar_value(current['MA30_Slope'])
                 
                 price_above_ma = current_close > current_ma30
                 ma_slope_positive = current_ma30_slope > 0
                 
+                # Determine phase
                 if price_above_ma and ma_slope_positive:
                     market_phase = 2  # Uptrend
                 elif price_above_ma and not ma_slope_positive:
@@ -196,10 +416,12 @@ class WeinsteinTickerAnalyzer:
                     market_phase = 1  # Base formation
                 
                 # Get market performance metrics
-                if len(market_data) >= 4:  # At least 4 weeks of data
-                    market_1month_perf = (float(market_data['Close'].iloc[-1]) / float(market_data['Close'].iloc[-4]) - 1) * 100
-                else:
-                    market_1month_perf = 0
+                market_1month_perf = 0
+                if len(market_data) >= self.MONTH_IN_WEEKS:
+                    market_1month_perf = (
+                        float(market_data['Close'].iloc[-1]) / 
+                        float(market_data['Close'].iloc[-self.MONTH_IN_WEEKS]) - 1
+                    ) * 100
                 
                 # Store market context
                 self.market_context = {
@@ -208,298 +430,417 @@ class WeinsteinTickerAnalyzer:
                     'performance_1month': market_1month_perf
                 }
                 
-                logger.info(f"Market context loaded: Phase {market_phase}")
-                
-                # Try to load sector data
-                self._load_sector_data()
-                
+                self.logger.info(f"Market context loaded: Phase {market_phase}")
             else:
-                logger.warning("No market context data available")
+                self.logger.warning("No market context data available")
                 self.market_context = None
-        
+                
         except Exception as e:
-            logger.warning(f"Error loading market context: {str(e)}")
+            self.logger.warning(f"Error loading market context: {str(e)}")
             self.market_context = None
-            
-    def _load_sector_data(self):
-        """Load sector data for the current ticker"""
+    
+    def _load_sector_data(self) -> None:
+        """Lädt Sektordaten für den aktuellen Ticker"""
         try:
-            # STRATEGY 1: First look in CSV files of ETF holdings
-            sector, sector_etf = find_sector_etf_from_csv(self.ticker_symbol)
+            sector, sector_etf = self._identify_sector_and_etf()
             
-            # If not found in CSV files, try alternative methods
-            if not sector or not sector_etf:
-                logger.info(f"Ticker {self.ticker_symbol} not found in sector ETF CSV files, trying alternative methods")
-                
-                # Get ticker info with detailed logging
-                ticker_obj = yf.Ticker(self.ticker_symbol)
-                ticker_info = ticker_obj.info
-                
-                # STRATEGY 2: Manually map common tickers to sectors
-                manual_sector_map = {
-                    'AAPL': ('Information Technology', 'XLK'),
-                    'MSFT': ('Information Technology', 'XLK'),
-                    'AMZN': ('Consumer Discretionary', 'XLY'),
-                    'GOOG': ('Communication Services', 'XLC'),
-                    'GOOGL': ('Communication Services', 'XLC'),
-                    'META': ('Communication Services', 'XLC'),
-                    'TSLA': ('Consumer Discretionary', 'XLY'),
-                    'JPM': ('Financials', 'XLF'),
-                    'V': ('Financials', 'XLF'),
-                    'NVDA': ('Information Technology', 'XLK'),
-                    'DIS': ('Communication Services', 'XLC')
-                    # Add more common tickers as needed
-                }
-                
-                # Check if we have a manual mapping for this ticker
-                if self.ticker_symbol.upper() in manual_sector_map:
-                    sector, sector_etf = manual_sector_map[self.ticker_symbol.upper()]
-                    logger.info(f"Using manual sector mapping for {self.ticker_symbol}: {sector} -> {sector_etf}")
-                
-                # STRATEGY 3: Try to get sector directly from ticker_info
-                elif ticker_info:
-                    # Try multiple possible keys where sector info might be stored
-                    sector_keys = ['sector', 'sectorDisp', 'sectorChain', 'industryGroup']
-                    for key in sector_keys:
-                        if key in ticker_info and ticker_info[key]:
-                            sector = ticker_info[key]
-                            logger.info(f"Found sector '{sector}' using key '{key}'")
-                            break
-                    
-                    # If no sector found, try industry as fallback
-                    if not sector:
-                        industry_keys = ['industry', 'industryDisp', 'industryKey']
-                        for key in industry_keys:
-                            if key in ticker_info and ticker_info[key]:
-                                industry = ticker_info[key]
-                                logger.info(f"No sector found, using industry: {industry}")
-                                
-                                # Map industry to sector (simplified mapping)
-                                industry_to_sector = {
-                                    'software': 'Information Technology',
-                                    'hardware': 'Information Technology',
-                                    'semiconductor': 'Information Technology',
-                                    'bank': 'Financials',
-                                    'insurance': 'Financials',
-                                    'pharma': 'Health Care',
-                                    'biotech': 'Health Care',
-                                    'medical': 'Health Care',
-                                    'retail': 'Consumer Discretionary',
-                                    'auto': 'Consumer Discretionary',
-                                    'aerospace': 'Industrials',
-                                    'defense': 'Industrials',
-                                    'telecom': 'Communication Services',
-                                    'media': 'Communication Services',
-                                    'food': 'Consumer Staples',
-                                    'beverage': 'Consumer Staples',
-                                    'oil': 'Energy',
-                                    'gas': 'Energy',
-                                    'chemical': 'Materials',
-                                    'mining': 'Materials',
-                                    'real estate': 'Real Estate',
-                                    'reit': 'Real Estate',
-                                    'utility': 'Utilities',
-                                    'electric': 'Utilities'
-                                }
-                                
-                                # Try to match industry to a sector
-                                industry_lower = industry.lower()
-                                for ind_key, sec_value in industry_to_sector.items():
-                                    if ind_key in industry_lower:
-                                        sector = sec_value
-                                        logger.info(f"Mapped industry '{industry}' to sector '{sector}'")
-                                        break
-                                
-                                if sector:
-                                    break
-            
-            # Sector to ETF mapping
-            sector_etfs = {
-                # Standard GICS sectors
-                'Information Technology': 'XLK',
-                'Financials': 'XLF',
-                'Health Care': 'XLV',
-                'Consumer Discretionary': 'XLY',
-                'Industrials': 'XLI',
-                'Communication Services': 'XLC',
-                'Consumer Staples': 'XLP',
-                'Energy': 'XLE',
-                'Materials': 'XLB',
-                'Real Estate': 'XLRE',
-                'Utilities': 'XLU',
-                
-                # Alternative/legacy sector names from Yahoo Finance
-                'Technology': 'XLK',
-                'Financial Services': 'XLF',
-                'Healthcare': 'XLV',
-                'Consumer Cyclical': 'XLY',
-                'Communication': 'XLC',
-                'Consumer Defensive': 'XLP',
-                'Basic Materials': 'XLB',
-                'Financial': 'XLF'
-            }
-            
-            # If we have a sector but no ETF yet, look it up in our mapping
-            if sector and not sector_etf:
-                if sector in sector_etfs:
-                    sector_etf = sector_etfs[sector]
-                    logger.info(f"Mapped sector '{sector}' to ETF '{sector_etf}'")
-                else:
-                    # Try case-insensitive matching
-                    sector_lower = sector.lower()
-                    for sec_key, etf in sector_etfs.items():
-                        if sec_key.lower() == sector_lower:
-                            sector_etf = etf
-                            logger.info(f"Case-insensitive match: '{sector}' to '{sec_key}' (ETF: {etf})")
-                            sector = sec_key  # Use the correctly cased sector name
-                            break
-            
-            # Only proceed with sector analysis if we have both sector and ETF
             if sector and sector_etf:
-                logger.info(f"Downloading data for sector ETF: {sector_etf}")
-                
-                # Download sector ETF data
-                sector_data = yf.download(
-                    sector_etf,
-                    period=self.period,
-                    interval=self.interval,
-                    progress=False
-                )
-                
-                if len(sector_data) > 0:
-                    # Calculate sector indicators
-                    sector_data['MA30'] = sector_data['Close'].rolling(window=30).mean()
-                    sector_data['MA30_Slope'] = sector_data['MA30'].diff()
-                    
-                    # Determine sector phase
-                    current_sector = sector_data.iloc[-1]
-                    
-                    # Safe extraction of scalar values
-                    try:
-                        sector_close = float(current_sector['Close']) if not pd.isna(current_sector['Close']).any() else 0
-                        sector_ma30 = float(current_sector['MA30']) if not pd.isna(current_sector['MA30']).any() else 0
-                        sector_ma30_slope = float(current_sector['MA30_Slope']) if not pd.isna(current_sector['MA30_Slope']).any() else 0
-                    except Exception as e:
-                        logger.warning(f"Error extracting sector values: {str(e)}")
-                        # Fallback method
-                        if isinstance(current_sector['Close'], pd.Series):
-                            sector_close = float(current_sector['Close'].iloc[0]) if not current_sector['Close'].empty else 0
-                        else:
-                            sector_close = float(current_sector['Close']) if not pd.isna(current_sector['Close']) else 0
-                            
-                        if isinstance(current_sector['MA30'], pd.Series):
-                            sector_ma30 = float(current_sector['MA30'].iloc[0]) if not current_sector['MA30'].empty else 0
-                        else:
-                            sector_ma30 = float(current_sector['MA30']) if not pd.isna(current_sector['MA30']) else 0
-                            
-                        if isinstance(current_sector['MA30_Slope'], pd.Series):
-                            sector_ma30_slope = float(current_sector['MA30_Slope'].iloc[0]) if not current_sector['MA30_Slope'].empty and not pd.isna(current_sector['MA30_Slope'].iloc[0]) else 0
-                        else:
-                            sector_ma30_slope = float(current_sector['MA30_Slope']) if not pd.isna(current_sector['MA30_Slope']) else 0
-                    
-                    sector_price_above_ma = sector_close > sector_ma30
-                    sector_ma_slope_positive = sector_ma30_slope > 0
-                    
-                    if sector_price_above_ma and sector_ma_slope_positive:
-                        sector_phase = 2  # Uptrend
-                    elif sector_price_above_ma and not sector_ma_slope_positive:
-                        sector_phase = 3  # Top formation
-                    elif not sector_price_above_ma and not sector_ma_slope_positive:
-                        sector_phase = 4  # Downtrend
-                    else:
-                        sector_phase = 1  # Base formation
-                    
-                    # Get sector performance metrics
-                    if len(sector_data) >= 4:
-                        sector_1month_perf = (float(sector_data['Close'].iloc[-1]) / float(sector_data['Close'].iloc[-4]) - 1) * 100
-                    else:
-                        sector_1month_perf = 0
-                    
-                    # Calculate relative strength vs market
-                    market_data = yf.download("^GSPC", period=self.period, interval=self.interval, progress=False)
-                    
-                    if len(market_data) == len(sector_data):
-                        relative_strength = (float(sector_data['Close'].iloc[-1]) / float(sector_data['Close'].iloc[0])) / \
-                                           (float(market_data['Close'].iloc[-1]) / float(market_data['Close'].iloc[0])) * 100 - 100
-                    else:
-                        # Handle mismatched lengths by using common date range
-                        logger.warning("Market and sector data lengths don't match. Using common date range for RS calculation.")
-                        common_start = max(market_data.index[0], sector_data.index[0])
-                        common_end = min(market_data.index[-1], sector_data.index[-1])
-                        
-                        market_start = float(market_data.loc[market_data.index >= common_start, 'Close'].iloc[0])
-                        market_end = float(market_data.loc[market_data.index <= common_end, 'Close'].iloc[-1])
-                        sector_start = float(sector_data.loc[sector_data.index >= common_start, 'Close'].iloc[0])
-                        sector_end = float(sector_data.loc[sector_data.index <= common_end, 'Close'].iloc[-1])
-                        
-                        market_perf = market_end / market_start
-                        sector_perf = sector_end / sector_start
-                        
-                        if market_perf > 0:
-                            relative_strength = (sector_perf / market_perf) * 100 - 100
-                        else:
-                            relative_strength = 0
-                    
-                    # Store sector context
-                    self.sector_data = {
-                        'name': sector,
-                        'etf': sector_etf,
-                        'phase': sector_phase,
-                        'last_close': float(sector_data['Close'].iloc[-1]),
-                        'performance_1month': sector_1month_perf,
-                        'relative_strength': relative_strength
-                    }
-                    
-                    logger.info(f"Sector data loaded: {sector} (Phase {sector_phase})")
-                else:
-                    logger.warning(f"Downloaded empty dataset for sector ETF {sector_etf}")
-                    self.sector_data = None
+                self._analyze_sector_performance(sector, sector_etf)
             else:
-                logger.warning(f"Skipping sector analysis for {self.ticker_symbol}: no valid sector or ETF determined")
+                self.logger.warning(
+                    f"Skipping sector analysis for {self.ticker_symbol}: "
+                    f"no valid sector or ETF determined"
+                )
                 self.sector_data = None
-                    
+                
         except Exception as e:
-            logger.error(f"Error in sector analysis: {str(e)}")
-            logger.error(traceback.format_exc())
+            self.logger.error(f"Error in sector analysis: {str(e)}")
+            self.logger.error(traceback.format_exc())
             self.sector_data = None
     
-    def create_interactive_chart(self):
-        """Create an interactive chart with Plotly and enhanced visualization"""
+    def _identify_sector_and_etf(self) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Identifiziert Sektor und zugehörigen ETF für den Ticker
+        
+        Returns:
+            Tuple[Optional[str], Optional[str]]: (Sektor, ETF Symbol)
+        """
+        # Strategy 1: Check CSV files
+        sector, sector_etf = find_sector_etf_from_csv(self.ticker_symbol)
+        
+        if sector and sector_etf:
+            return sector, sector_etf
+        
+        # Strategy 2: Manual mapping
+        ticker_upper = self.ticker_symbol.upper()
+        if ticker_upper in self.MANUAL_TICKER_SECTOR_MAP:
+            return self.MANUAL_TICKER_SECTOR_MAP[ticker_upper]
+        
+        # Strategy 3: Get from ticker info
+        sector = self._extract_sector_from_ticker_info()
+        
+        if sector:
+            # Map sector to ETF
+            sector_etf = self._map_sector_to_etf(sector)
+            if sector_etf:
+                return sector, sector_etf
+        
+        return None, None
+    
+    def _extract_sector_from_ticker_info(self) -> Optional[str]:
+        """
+        Extrahiert Sektor-Information aus Ticker-Info
+        
+        Returns:
+            Optional[str]: Sektor oder None
+        """
+        try:
+            ticker_obj = self.data_provider.Ticker(self.ticker_symbol)
+            ticker_info = ticker_obj.info
+            
+            # Try sector keys
+            sector_keys = ['sector', 'sectorDisp', 'sectorChain', 'industryGroup']
+            for key in sector_keys:
+                if key in ticker_info and ticker_info[key]:
+                    return ticker_info[key]
+            
+            # Try industry as fallback
+            industry_keys = ['industry', 'industryDisp', 'industryKey']
+            for key in industry_keys:
+                if key in ticker_info and ticker_info[key]:
+                    industry = ticker_info[key]
+                    # Map industry to sector
+                    return self._map_industry_to_sector(industry)
+                    
+        except Exception as e:
+            self.logger.debug(f"Error extracting sector from ticker info: {str(e)}")
+        
+        return None
+    
+    def _map_industry_to_sector(self, industry: str) -> Optional[str]:
+        """
+        Mappt Industry zu Sektor
+        
+        Args:
+            industry: Industry Name
+            
+        Returns:
+            Optional[str]: Sektor oder None
+        """
+        industry_lower = industry.lower()
+        for ind_key, sec_value in self.INDUSTRY_TO_SECTOR_MAP.items():
+            if ind_key in industry_lower:
+                return sec_value
+        return None
+    
+    def _map_sector_to_etf(self, sector: str) -> Optional[str]:
+        """
+        Mappt Sektor zu ETF Symbol
+        
+        Args:
+            sector: Sektor Name
+            
+        Returns:
+            Optional[str]: ETF Symbol oder None
+        """
+        # Direct mapping
+        if sector in self.SECTOR_ETF_MAP:
+            return self.SECTOR_ETF_MAP[sector]
+        
+        # Case-insensitive matching
+        sector_lower = sector.lower()
+        for sec_key, etf in self.SECTOR_ETF_MAP.items():
+            if sec_key.lower() == sector_lower:
+                return etf
+        
+        return None
+    
+    def _analyze_sector_performance(self, sector: str, sector_etf: str) -> None:
+        """
+        Analysiert die Performance des Sektors
+        
+        Args:
+            sector: Sektor Name
+            sector_etf: ETF Symbol für den Sektor
+        """
+        self.logger.info(f"Downloading data for sector ETF: {sector_etf}")
+        
+        sector_data = self._get_cached_market_data(sector_etf, self.period, self.interval)
+        
+        if sector_data is None or len(sector_data) == 0:
+            self.logger.warning(f"No data available for sector ETF {sector_etf}")
+            return
+        
+        # Calculate sector indicators
+        sector_data['MA30'] = sector_data['Close'].rolling(window=self.DEFAULT_MA_PERIOD).mean()
+        sector_data['MA30_Slope'] = sector_data['MA30'].diff()
+        
+        # Determine sector phase
+        current_sector = sector_data.iloc[-1]
+        
+        sector_close = self._extract_scalar_value(current_sector['Close'])
+        sector_ma30 = self._extract_scalar_value(current_sector['MA30'])
+        sector_ma30_slope = self._extract_scalar_value(current_sector['MA30_Slope'])
+        
+        sector_price_above_ma = sector_close > sector_ma30
+        sector_ma_slope_positive = sector_ma30_slope > 0
+        
+        # Determine phase
+        if sector_price_above_ma and sector_ma_slope_positive:
+            sector_phase = 2  # Uptrend
+        elif sector_price_above_ma and not sector_ma_slope_positive:
+            sector_phase = 3  # Top formation
+        elif not sector_price_above_ma and not sector_ma_slope_positive:
+            sector_phase = 4  # Downtrend
+        else:
+            sector_phase = 1  # Base formation
+        
+        # Get sector performance metrics
+        sector_1month_perf = 0
+        if len(sector_data) >= self.MONTH_IN_WEEKS:
+            sector_1month_perf = (
+                float(sector_data['Close'].iloc[-1]) / 
+                float(sector_data['Close'].iloc[-self.MONTH_IN_WEEKS]) - 1
+            ) * 100
+        
+        # Calculate relative strength vs market
+        relative_strength = self._calculate_relative_strength(sector_data)
+        
+        # Store sector context
+        self.sector_data = {
+            'name': sector,
+            'etf': sector_etf,
+            'phase': sector_phase,
+            'last_close': float(sector_data['Close'].iloc[-1]),
+            'performance_1month': sector_1month_perf,
+            'relative_strength': relative_strength
+        }
+        
+        self.logger.info(f"Sector data loaded: {sector} (Phase {sector_phase})")
+    
+    def _calculate_relative_strength(self, sector_data: pd.DataFrame) -> float:
+        """
+        Berechnet die relative Stärke des Sektors zum Markt
+        
+        Args:
+            sector_data: Sektor-Daten
+            
+        Returns:
+            float: Relative Stärke in Prozent
+        """
+        try:
+            market_data = self._get_cached_market_data("^GSPC", self.period, self.interval)
+            
+            if market_data is None or len(market_data) == 0:
+                return 0
+            
+            if len(market_data) == len(sector_data):
+                relative_strength = (
+                    (float(sector_data['Close'].iloc[-1]) / float(sector_data['Close'].iloc[0])) /
+                    (float(market_data['Close'].iloc[-1]) / float(market_data['Close'].iloc[0]))
+                ) * 100 - 100
+            else:
+                # Handle mismatched lengths
+                common_start = max(market_data.index[0], sector_data.index[0])
+                common_end = min(market_data.index[-1], sector_data.index[-1])
+                
+                market_start = float(market_data.loc[market_data.index >= common_start, 'Close'].iloc[0])
+                market_end = float(market_data.loc[market_data.index <= common_end, 'Close'].iloc[-1])
+                sector_start = float(sector_data.loc[sector_data.index >= common_start, 'Close'].iloc[0])
+                sector_end = float(sector_data.loc[sector_data.index <= common_end, 'Close'].iloc[-1])
+                
+                market_perf = market_end / market_start
+                sector_perf = sector_end / sector_start
+                
+                relative_strength = (sector_perf / market_perf) * 100 - 100 if market_perf > 0 else 0
+            
+            return relative_strength
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating relative strength: {str(e)}")
+            return 0
+    
+    def _analyze_phase(self) -> None:
+        """Analysiert die Weinstein-Phase"""
+        if self.data is not None:
+            self.phase, self.phase_desc = identify_weinstein_phase(self.data)
+    
+    def _generate_recommendations(self) -> None:
+        """Generiert Handelsempfehlungen und detaillierte Analyse"""
+        if self.data is not None:
+            # Generate recommendation
+            self.recommendation = generate_recommendation(
+                self.data, self.phase, self.phase_desc,
+                self.market_context, self.sector_data
+            )
+            
+            # Generate detailed analysis
+            self.detailed_analysis = generate_detailed_analysis(
+                self.ticker_symbol, self.phase, self.phase_desc,
+                self.recommendation, self.data, self.last_price,
+                self.market_context, self.sector_data,
+                self.support_resistance_levels
+            )
+    
+    def _run_backtest(self) -> None:
+        """Führt automatisch einen Backtest durch wenn genügend Daten vorhanden sind"""
+        if self.data is not None and len(self.data) >= self.MIN_BACKTEST_DATAPOINTS:
+            self.backtest_results = perform_simplified_backtest(self.data, self.ticker_symbol)
+            if self.backtest_results["success"]:
+                self.logger.info(
+                    f"Backtest completed automatically with "
+                    f"{self.backtest_results['total_trades']} trades"
+                )
+            else:
+                self.logger.warning(
+                    f"Automatic backtest failed: "
+                    f"{self.backtest_results.get('error', 'Unknown error')}"
+                )
+        else:
+            data_points = len(self.data) if self.data is not None else 0
+            self.backtest_results = {
+                "success": False,
+                "error": (
+                    f"Insufficient data for backtest. Need at least "
+                    f"{self.MIN_BACKTEST_DATAPOINTS} data points, found {data_points}."
+                )
+            }
+            self.logger.warning(f"Not enough data for automatic backtest: {data_points} data points")
+    
+    def get_analysis_result(self) -> AnalysisResult:
+        """
+        Gibt das strukturierte Analyse-Ergebnis zurück
+        
+        Returns:
+            AnalysisResult: Strukturiertes Ergebnis-Objekt
+        """
+        # Extract support and resistance levels
+        support_levels = []
+        resistance_levels = []
+        
+        for level in self.support_resistance_levels:
+            if level['type'] == 'support':
+                support_levels.append(level['price'])
+            else:
+                resistance_levels.append(level['price'])
+        
+        return AnalysisResult(
+            success=len(self.errors) == 0,
+            ticker=self.ticker_symbol or "",
+            phase=self.phase,
+            phase_description=self.phase_desc,
+            recommendation=self.recommendation,
+            detailed_analysis=self.detailed_analysis,
+            last_price=self.last_price,
+            support_levels=support_levels,
+            resistance_levels=resistance_levels,
+            support_resistance_data=self.support_resistance_levels,
+            market_context=self.market_context,
+            sector_data=self.sector_data,
+            backtest_results=self.backtest_results,
+            ticker_info=self.ticker_info,
+            errors=self.errors.copy(),
+            warnings=self.warnings.copy()
+        )
+    
+    def create_interactive_chart(self) -> Any:
+        """
+        Erstellt ein interaktives Chart mit Plotly
+        
+        Returns:
+            Plotly Figure Object
+        """
+        if self.data is None:
+            raise ValueError("No data available for charting")
+            
         return create_interactive_chart(
-            self.data, 
-            self.ticker_symbol, 
-            self.phase, 
-            self.phase_desc, 
-            self.recommendation, 
-            self.support_resistance_levels, 
+            self.data,
+            self.ticker_symbol,
+            self.phase,
+            self.phase_desc,
+            self.recommendation,
+            self.support_resistance_levels,
             self.last_price
         )
     
-    def create_volume_profile(self, lookback_period=None):
-        """Create a volume profile for the specified timeframe"""
+    def create_volume_profile(self, lookback_period: Optional[int] = None) -> Any:
+        """
+        Erstellt ein Volumen-Profil für den angegebenen Zeitraum
+        
+        Args:
+            lookback_period: Anzahl der Perioden für das Profil
+            
+        Returns:
+            Plotly Figure Object
+        """
+        if self.data is None:
+            raise ValueError("No data available for volume profile")
+            
         return create_volume_profile(
-            self.data, 
-            self.ticker_symbol, 
-            self.last_price, 
+            self.data,
+            self.ticker_symbol,
+            self.last_price,
             lookback_period
         )
     
-    def create_simplified_backtest_charts(self, backtest_results=None):
-        """Create simplified charts for backtesting results"""
+    def create_simplified_backtest_charts(self, 
+                                        backtest_results: Optional[Dict[str, Any]] = None) -> Any:
+        """
+        Erstellt vereinfachte Charts für Backtesting-Ergebnisse
+        
+        Args:
+            backtest_results: Optionale Backtest-Ergebnisse
+            
+        Returns:
+            Plotly Figure Objects
+        """
         # Use passed backtest_results or self.backtest_results
         if backtest_results is None:
             backtest_results = self.backtest_results
-            
+        
         if backtest_results is None:
             # If still None, run the backtest first
-            self.backtest_results = perform_simplified_backtest(self.data, self.ticker_symbol)
+            self._run_backtest()
             backtest_results = self.backtest_results
         
         # Get price data for Buy & Hold comparison
         price_data = None
         if self.data is not None and 'Close' in self.data.columns:
             price_data = get_safe_series(self.data, 'Close')
-            
+        
         # Create charts
-        from utils.backtest_utils import create_backtest_charts
         return create_backtest_charts(backtest_results, price_data)
+
+
+# Convenience function für einfache Nutzung
+def analyze_ticker(ticker: str, period: str = "1y", 
+                  interval: str = "1wk") -> AnalysisResult:
+    """
+    Convenience function für schnelle Ticker-Analyse
+    
+    Args:
+        ticker: Stock ticker symbol
+        period: Time period for data
+        interval: Data interval
+        
+    Returns:
+        AnalysisResult: Strukturiertes Analyse-Ergebnis
+    """
+    analyzer = WeinsteinTickerAnalyzer()
+    success = analyzer.load_data(ticker, period, interval)
+    
+    if not success:
+        # Return error result
+        return AnalysisResult(
+            success=False,
+            ticker=ticker,
+            phase=0,
+            phase_description="",
+            recommendation="",
+            detailed_analysis="",
+            last_price=None,
+            errors=analyzer.errors,
+            warnings=analyzer.warnings
+        )
+    
+    return analyzer.get_analysis_result()
